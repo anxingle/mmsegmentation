@@ -1,6 +1,6 @@
 [project]
 name = "mmsegmentation"
-version = "0.1.0"
+version = "1.2.2"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,16 +16,18 @@ dependencies = [
     "invisible-watermark>=0.2.0",
     "kornia==0.6",
     "matplotlib>=3.10.7",
-    "mmcv>=2.2.0",
+    "mmcv==2.1.0",
     "mmdet>=3.1.0",
     "mmengine>=0.10.7",
     "nibabel>=5.3.2",
+    "ninja>=1.13.0",
     "numpy>=2.3.4",
     "omegaconf==2.1.1",
     "opencv-python>=4.11.0.86",
     "packaging>=25.0",
     "pillow>=11.3.0",
     "prettytable>=3.16.0",
+    "psutil>=7.1.1",
     "pudb==2019.2",
     "pytest>=8.4.2",
     "pytorch-lightning==1.4.2",
@@ -42,3 +44,6 @@ dependencies = [
     "xdoctest>=0.10.0",
     "yapf>=0.43.0",
 ]
+
+# [tool.uv.sources]
+# openai-agents = { path = "/data/an/mmcv", editable = true }

@@ -118,3 +118,6 @@ mmseg/.mim
 
 # Pytorch
 *.pth
+datasets/*
+Watermelon87_Semantic_Seg_Mask/*
+outputs/*.jpg
