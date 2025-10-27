@@ -15,6 +15,20 @@ from .transforms import (CLAHE, AdjustGamma, Albu, BioMedical3DPad,
                          ResizeShortestEdge, ResizeToMultiple, RGB2Gray,
                          SegRescale)
 
+from .processing import (BEiTMaskGenerator, CleanCaption,
+                         ColorJitter, EfficientNetCenterCrop,
+                         EfficientNetRandomCrop, Lighting,
+                         MAERandomResizedCrop, RandomErasing,
+                         RandomResizedCrop,
+                         RandomResizedCropAndInterpolationWithTwoPic,
+                         RandomTranslatePad, ResizeEdge, SimMIMMaskGenerator)
+
+from .auto_augment import (AutoAugment, AutoContrast, BaseAugTransform,
+                           Brightness, ColorTransform, Contrast, Cutout,
+                           Equalize, GaussianBlur, Invert, Posterize,
+                           RandAugment, Rotate, Sharpness, Shear, Solarize,
+                           SolarizeAdd, Translate)
+
 # yapf: enable
 __all__ = [
     'LoadAnnotations', 'RandomCrop', 'BioMedical3DRandomCrop', 'SegRescale',
@@ -26,5 +40,5 @@ __all__ = [
     'BioMedical3DRandomFlip', 'BioMedicalRandomGamma', 'BioMedical3DPad',
     'RandomRotFlip', 'Albu', 'LoadSingleRSImageFromFile', 'ConcatCDInput',
     'LoadMultipleRSImageFromFile', 'LoadDepthAnnotation', 'RandomDepthMix',
-    'RandomFlip', 'Resize'
+    'RandomFlip', 'Resize', 'ColorJitter', 'GaussianBlur',
 ]

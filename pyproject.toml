@@ -16,7 +16,6 @@ dependencies = [
     "invisible-watermark>=0.2.0",
     "kornia==0.6",
     "matplotlib>=3.10.7",
-    "mmcv==2.1.0",
     "mmdet>=3.1.0",
     "mmengine>=0.10.7",
     "nibabel>=5.3.2",
