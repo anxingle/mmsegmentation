@@ -10,7 +10,7 @@ _FINAL_SIZE = (1024, 1024)
 _NUM_CLASSES = 2
 _DATA_ROOT = 'datasets/tongue_seg_v0/'
 _DATASET_TYPE = 'ZihaoDataset'
-_MAX_EPOCH = 350
+_MAX_EPOCH = 450
 
 _DATA_PREPROCESSOR = dict(
     type='SegDataPreProcessor',
@@ -37,7 +37,7 @@ log_processor = dict(by_epoch=True)
 # ---- Hooks & Visualizer（mmseg 可视化 + mmcv 已安装）
 default_hooks = dict(
     checkpoint=dict(type='CheckpointHook', by_epoch=True, interval=1, max_keep_ckpts=30, save_best='mDice'),
-    logger=dict(type='LoggerHook', interval=1, log_metric_by_epoch=True),
+    logger=dict(type='LoggerHook', interval=100, log_metric_by_epoch=True),
     param_scheduler=dict(type='ParamSchedulerHook'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     timer=dict(type='IterTimerHook'),
@@ -79,8 +79,8 @@ model = dict(
         concat_input=False, dropout_ratio=0.1, num_classes=_NUM_CLASSES,
         norm_cfg=_NORM_CFG, align_corners=False, ignore_index=255,
         loss_decode=[
-            dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0, loss_name='loss_ce', avg_non_ignore=True),
-            dict(type='DiceLoss', eps=1e-3, naive_dice=False, use_sigmoid=False, loss_weight=1.0, loss_name='loss_dice'),
+            dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.8, loss_name='loss_ce', avg_non_ignore=True),
+            dict(type='DiceLoss', eps=1e-3, naive_dice=False, use_sigmoid=False, loss_weight=1.2, loss_name='loss_dice'),
         ],
     ),
     auxiliary_head=dict(
@@ -89,8 +89,8 @@ model = dict(
         concat_input=False, dropout_ratio=0.1, num_classes=_NUM_CLASSES,
         norm_cfg=_NORM_CFG, align_corners=False, ignore_index=255,
         loss_decode=[
-            dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.2, loss_name='loss_ce_aux', avg_non_ignore=True),
-            dict(type='DiceLoss', eps=1e-3, naive_dice=False, use_sigmoid=False, loss_weight=0.2, loss_name='loss_dice_aux'),
+            dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.15, loss_name='loss_ce_aux', avg_non_ignore=True),
+            dict(type='DiceLoss', eps=1e-3, naive_dice=False, use_sigmoid=False, loss_weight=0.25, loss_name='loss_dice_aux'),
         ],
     ),
     train_cfg=dict(),
@@ -101,12 +101,17 @@ model = dict(
 optim_wrapper = dict(
     type='AmpOptimWrapper',
     optimizer=dict(type='AdamW', lr=6e-4, betas=(0.9, 0.999), weight_decay=0.01),
+    paramwise_cfg=dict(  # 归一化与偏置不 decay，常带来 0.1~0.3 mDice
+        norm_decay_mult=0.0, bias_decay_mult=0.0),
 )
-param_scheduler = [dict(type='PolyLR', eta_min=1e-6, power=0.9, begin=0, end=_MAX_EPOCH, by_epoch=True)]
+param_scheduler = [
+	dict(type='LinearLR', start_factor=1/10, by_epoch=True, begin=0, end=10),
+	dict(type='PolyLR', eta_min=1e-6, power=0.9, begin=10, end=_MAX_EPOCH, by_epoch=True),
+]
 
 # ---- Loops
 randomness = dict(seed=0)
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_MAX_EPOCH, val_interval=5)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_MAX_EPOCH, val_interval=3)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
@@ -118,10 +123,11 @@ train_pipeline = [
     dict(type='LoadAnnotations'),
     dict(type='Resize', keep_ratio=True, scale=(_LONG_EDGE, _LONG_EDGE), interpolation='bilinear'),
     dict(type='RandomCrop', crop_size=_FINAL_SIZE, cat_max_ratio=0.75),
+	dict(type='RandomRotate', prob=0.3, degree=5),   # 面部轻微转头常见
     dict(type='RandomFlip', prob=0.5, direction='horizontal'),
     dict(type='ColorJitter', brightness=0.09, contrast=0.09, saturation=0.09, hue=[0.001, 0.009], backend='pillow'),
     # dict(type='GaussianBlur', ksize=3, sigma_min=0.1, sigma_max=0.3, prob=0.2),
-	    dict(
+	dict(
         type='GaussianBlur',
         magnitude_range=(0.2, 0.5),  # 较轻的模糊程度
         magnitude_std='inf',
