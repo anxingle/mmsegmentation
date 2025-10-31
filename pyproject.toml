@@ -18,6 +18,7 @@ dependencies = [
     "matplotlib>=3.10.7",
     "mmdet>=3.1.0",
     "mmengine>=0.10.7",
+    "new-logger>=0.1.0",
     "nibabel>=5.3.2",
     "ninja>=1.13.0",
     "numpy>=2.3.4",

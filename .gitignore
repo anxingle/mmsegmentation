@@ -121,3 +121,4 @@ mmseg/.mim
 datasets/*
 Watermelon87_Semantic_Seg_Mask/*
 outputs/*.jpg
+nohup_minrun*.out
