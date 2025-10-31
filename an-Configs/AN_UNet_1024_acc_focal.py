@@ -7,10 +7,10 @@ IMG_SUFFIX = '.png'   # 改成你的真实图片后缀：'.png' / '.jpeg' ...
 SEG_SUFFIX = '.png'   # 改成你的真实标注后缀：'.png' / '.bmp' ...
 
 _FINAL_SIZE = (1024, 1024)
-_NUM_CLASSES = 2
-_DATA_ROOT = 'datasets/tongue_seg_v1/'
+_NUM_CLASSES = 1
+_DATA_ROOT = 'datasets/tongue_seg_v0/'
 _DATASET_TYPE = 'ZihaoDataset'
-_MAX_EPOCH = 300
+_MAX_EPOCH = 350
 
 _DATA_PREPROCESSOR = dict(
     type='SegDataPreProcessor',
@@ -79,8 +79,20 @@ model = dict(
         concat_input=False, dropout_ratio=0.1, num_classes=_NUM_CLASSES,
         norm_cfg=_NORM_CFG, align_corners=False, ignore_index=255,
         loss_decode=[
-            dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.8, loss_name='loss_ce', avg_non_ignore=True),
-            dict(type='DiceLoss', eps=1e-3, naive_dice=False, use_sigmoid=False, loss_weight=1.2, loss_name='loss_dice'),
+            # dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.5,  # CE 权重降低
+            #     class_weight=[0.2, 0.8], # 背景:0.2, 前景:0.8
+            #     loss_name='loss_ce', 
+			# 	avg_non_ignore=True,  # ← 保留 class_weight 必须关掉 avg_non_ignore
+			# 	),
+            dict(type='FocalLoss',
+                use_sigmoid=True,  # 两类 softmax 也支持，内部会处理
+                gamma=2.0,
+                alpha=0.8,         # ← 前景偏置，0.75~0.85 都可试
+                loss_weight=0.5,   # 等价于你之前 CE 的权重
+                loss_name='loss_focal'),
+            dict(type='DiceLoss', eps=1e-3, naive_dice=False, use_sigmoid=True, 
+				 loss_weight=1.5, # Dice 权重提高， 贴合前景 
+				 loss_name='loss_dice'),
         ],
     ),
     auxiliary_head=dict(
@@ -89,29 +101,35 @@ model = dict(
         concat_input=False, dropout_ratio=0.1, num_classes=_NUM_CLASSES,
         norm_cfg=_NORM_CFG, align_corners=False, ignore_index=255,
         loss_decode=[
-            dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.15, loss_name='loss_ce_aux', avg_non_ignore=True),
-            dict(type='DiceLoss', eps=1e-3, naive_dice=False, use_sigmoid=False, loss_weight=0.25, loss_name='loss_dice_aux'),
+            # dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.1,  # 辅助 CE 权重降低,总体更轻
+			# 	 loss_name='loss_ce_aux', 
+			# 	 class_weight=[0.2, 0.8], # 背景:0.2, 前景:0.8
+			# 	 avg_non_ignore=True,  # ← 保留 class_weight 必须关掉 avg_non_ignore
+			# 	 ),
+			dict(type='FocalLoss',
+                use_sigmoid=True,   # 两类 softmax 也支持，内部会处理
+                gamma=2.0,
+                alpha=0.8,           # ← 前景偏置，0.75~0.85 都可试
+                loss_weight=0.1,     # 等价于你之前 CE 的权重
+                loss_name='loss_focal_aux'
+			),
+            dict(type='DiceLoss', eps=1e-3, naive_dice=False, use_sigmoid=True, loss_weight=0.2, loss_name='loss_dice_aux'),
         ],
     ),
     train_cfg=dict(),
-    test_cfg=dict(mode='whole', crop_size=_FINAL_SIZE, stride=(768, 768)),
+    test_cfg=dict(mode='slide', crop_size=_FINAL_SIZE, stride=(768, 768)),
 )
 
 # ---- Optim & schedule
 optim_wrapper = dict(
     type='AmpOptimWrapper',
     optimizer=dict(type='AdamW', lr=6e-4, betas=(0.9, 0.999), weight_decay=0.01),
-    paramwise_cfg=dict(  # 归一化与偏置不 decay，常带来 0.1~0.3 mDice
-        norm_decay_mult=0.0, bias_decay_mult=0.0),
 )
-param_scheduler = [
-	dict(type='LinearLR', start_factor=1/10, by_epoch=True, begin=0, end=10),
-	dict(type='PolyLR', eta_min=1e-6, power=0.9, begin=10, end=_MAX_EPOCH, by_epoch=True),
-]
+param_scheduler = [dict(type='PolyLR', eta_min=1e-6, power=0.9, begin=0, end=_MAX_EPOCH, by_epoch=True)]
 
 # ---- Loops
 randomness = dict(seed=0)
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_MAX_EPOCH, val_interval=1)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_MAX_EPOCH, val_interval=2)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
@@ -122,16 +140,16 @@ train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations'),
     dict(type='Resize', keep_ratio=True, scale=(_LONG_EDGE, _LONG_EDGE), interpolation='bilinear'),
-    dict(type='RandomCrop', crop_size=_FINAL_SIZE, cat_max_ratio=0.94),
-	dict(type='RandomRotate', prob=0.3, degree=5),   # 面部轻微转头常见
+    dict(type='RandomCrop', crop_size=_FINAL_SIZE, cat_max_ratio=0.75),
     dict(type='RandomFlip', prob=0.5, direction='horizontal'),
+	dict(type='RandomRotate', prob=0.3, degree=5),   # 面部轻微转头常见
     dict(type='ColorJitter', brightness=0.09, contrast=0.09, saturation=0.09, hue=[0.001, 0.009], backend='pillow'),
     # dict(type='GaussianBlur', ksize=3, sigma_min=0.1, sigma_max=0.3, prob=0.2),
-	dict(
+	    dict(
         type='GaussianBlur',
         magnitude_range=(0.2, 0.5),  # 较轻的模糊程度
         magnitude_std='inf',
-        prob=0.5  # 50%概率应用模糊
+        prob=0.3  # 80%概率应用模糊
     ),
     dict(type='PackSegInputs'),
 ]
@@ -149,7 +167,7 @@ test_pipeline = [
 
 # ---- Dataloaders（显式写后缀，避免 data_list 为空）
 train_dataloader = dict(
-    batch_size=6, num_workers=8, persistent_workers=True,
+    batch_size=4, num_workers=8, persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(
         type=_DATASET_TYPE,
@@ -162,7 +180,7 @@ train_dataloader = dict(
     ),
 )
 val_dataloader = dict(
-    batch_size=1, num_workers=8, persistent_workers=True,
+    batch_size=1, num_workers=4, persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
         type=_DATASET_TYPE,
@@ -175,7 +193,7 @@ val_dataloader = dict(
     ),
 )
 test_dataloader = dict(
-    batch_size=1, num_workers=8, persistent_workers=True,
+    batch_size=1, num_workers=4, persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
         type=_DATASET_TYPE,
@@ -195,17 +213,12 @@ tta_model = dict(type='SegTTAModel')
 tta_pipeline = [
     dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
     dict(type='TestTimeAug', transforms=[
-        [
-         dict(type='Resize', keep_ratio=True, scale_factor=0.7),
-         dict(type='Resize', keep_ratio=True, scale_factor=0.8),
-		 dict(type='Resize', keep_ratio=True, scale_factor=0.9),
+        [dict(type='Resize', keep_ratio=True, scale_factor=0.75),
          dict(type='Resize', keep_ratio=True, scale_factor=1.0),
-		 dict(type='Resize', keep_ratio=True, scale_factor=1.1),
-		 dict(type='Resize', keep_ratio=True, scale_factor=1.2),
-         dict(type='Resize', keep_ratio=True, scale_factor=1.3)],
+         dict(type='Resize', keep_ratio=True, scale_factor=1.25)],
         [dict(type='RandomFlip', direction='horizontal', prob=0.0),
          dict(type='RandomFlip', direction='horizontal', prob=1.0)],
         [dict(type='PackSegInputs')],
     ]),
 ]
-work_dir = './work_dirs/AN_UNet_1024_acc_minrun_v1_handcut90'
+work_dir = './work_dirs/AN_UNet_1024_acc_focal'
