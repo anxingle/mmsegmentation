@@ -10,7 +10,7 @@ Example:
 
 import argparse
 from pathlib import Path
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -21,56 +21,32 @@ import torch.nn.functional as F
 # Keeping them as tensors allows direct broadcasting when normalizing inputs.
 MEAN = torch.tensor([123.675, 116.28, 103.53]).view(1, 3, 1, 1)
 STD = torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1)
+DEFAULT_TTA_SCALES: Tuple[float, ...] = (0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3)
+LONG_EDGE = 1536
+SIZE_DIVISOR = 32
 
 
-def parse_shape(values) -> Tuple[int, int] | None:
-    """Parse `--shape` CLI argument of the form HEIGHT WIDTH."""
-    if values is None:
-        return None
-    if len(values) != 2:
-        raise argparse.ArgumentTypeError('Shape expects two integers: HEIGHT WIDTH.')
-    height, width = map(int, values)
-    if height <= 0 or width <= 0:
-        raise argparse.ArgumentTypeError('Shape dimensions must be positive.')
-    return height, width
+def _preprocess_image(
+        image: Image.Image,
+        target_size: Tuple[int, int],
+        orig_size: Tuple[int, int],
+        pad_to_divisor: bool,
+        size_divisor: int,
+        flip: bool) -> tuple[torch.Tensor, dict[str, tuple[int, int] | bool]]:
+    """Resize, optionally flip/pad, normalize, and return tensor plus metadata."""
+    resize_h, resize_w = target_size
+    if image.size != (resize_w, resize_h):
+        image = image.resize((resize_w, resize_h), Image.BILINEAR)
 
-
-def load_image(image_path: Path,
-               resize_shape: Tuple[int, int] | None,
-               match_test_pipeline: bool,
-               long_edge: int,
-               size_divisor: int) -> tuple[torch.Tensor, dict[str, tuple[int, int]]]:
-    """Load an RGB image, optionally resize, pad, and normalize to match training stats."""
-    image = Image.open(image_path).convert('RGB')
-    orig_w, orig_h = image.size
-
-    resize_h, resize_w = orig_h, orig_w
-    pad_h = pad_w = 0
-
-    if match_test_pipeline:
-        if long_edge <= 0:
-            raise ValueError('`--long-edge` must be positive when matching test pipeline.')
-        if size_divisor <= 0:
-            raise ValueError('`--size-divisor` must be positive when matching test pipeline.')
-        scale = long_edge / max(orig_h, orig_w)
-        if scale != 1.0:
-            resize_h = max(int(round(orig_h * scale)), 1)
-            resize_w = max(int(round(orig_w * scale)), 1)
-        else:
-            resize_h, resize_w = orig_h, orig_w
-        if image.size != (resize_w, resize_h):
-            image = image.resize((resize_w, resize_h), Image.BILINEAR)
-    elif resize_shape is not None:
-        target_h, target_w = resize_shape
-        resize_h, resize_w = target_h, target_w
-        # Bilinear resize keeps smooth edges that work well with segmentation models.
-        if image.size != (target_w, target_h):
-            image = image.resize((target_w, target_h), Image.BILINEAR)
-
-    # Convert to CHW float tensor and normalize with training mean/std.
     np_img = np.asarray(image, dtype=np.float32)
 
-    if match_test_pipeline:
+    if flip:
+        np_img = np_img[:, ::-1, :]
+
+    pad_h = pad_w = 0
+    if pad_to_divisor:
+        if size_divisor <= 0:
+            raise ValueError('`size_divisor` must be positive when padding is enabled.')
         pad_h = (size_divisor - (resize_h % size_divisor)) % size_divisor
         pad_w = (size_divisor - (resize_w % size_divisor)) % size_divisor
         if pad_h or pad_w:
@@ -85,12 +61,38 @@ def load_image(image_path: Path,
     tensor = (tensor - MEAN) / STD
 
     meta = {
-        'orig_size': (orig_h, orig_w),
+        'orig_size': orig_size,
         'resized_size': (resize_h, resize_w),
         'pad': (pad_h, pad_w),
+        'flip': flip,
     }
-
     return tensor, meta
+
+
+def _forward_variant(model: torch.jit.ScriptModule,
+                     tensor: torch.Tensor,
+                     meta: dict[str, tuple[int, int] | bool],
+                     device: str) -> torch.Tensor:
+    """Forward pass with padding removal, optional flip correction, and resize."""
+    tensor = tensor.to(device)
+    with torch.no_grad():
+        logits = model(tensor)
+
+    pad_h, pad_w = meta['pad']
+    if pad_h or pad_w:
+        valid_h = logits.shape[2] - pad_h
+        valid_w = logits.shape[3] - pad_w
+        logits = logits[..., :valid_h, :valid_w]
+
+    if meta.get('flip', False):
+        logits = torch.flip(logits, dims=[3])
+
+    orig_h, orig_w = meta['orig_size']
+    resized_h, resized_w = meta['resized_size']
+    if (resized_h, resized_w) != (orig_h, orig_w):
+        logits = F.interpolate(logits, size=(orig_h, orig_w), mode='bilinear', align_corners=False)
+
+    return logits
 
 
 def logits_to_mask(logits: torch.Tensor,
@@ -129,56 +131,95 @@ def save_mask(mask: torch.Tensor,
     mask_img.save(output_path)
 
 
-def run_inference(model_path: Path,
-                  image_path: Path,
-                  output_path: Path | None,
-                  resize_shape: Tuple[int, int] | None,
-                  match_test_pipeline: bool,
-                  long_edge: int,
-                  size_divisor: int,
-                  device: str,
-                  threshold: float,
-                  binary_colormap: bool) -> Path:
-    """End-to-end inference pipeline: load model, preprocess image, run, postprocess."""
-    model = torch.jit.load(str(model_path), map_location=device)
-    model.eval()
+def _run_tta_inference(model: torch.jit.ScriptModule,
+                       image_path: Path,
+                       output_path: Path | None,
+                       device: str,
+                       threshold: float,
+                       binary_colormap: bool,
+                       size_divisor: int,
+                       tta_scales: Sequence[float],
+                       long_edge: int) -> Path:
+    """Multi-scale + horizontal flip TTA plus test-pipeline resize averaging."""
+    base_image = Image.open(image_path).convert('RGB')
+    orig_w, orig_h = base_image.size
+    orig_size = (orig_h, orig_w)
 
-    # Preprocess image and keep track of original resolution for later upsampling.
-    tensor, meta = load_image(
-        image_path=image_path,
-        resize_shape=resize_shape,
-        match_test_pipeline=match_test_pipeline,
-        long_edge=long_edge,
+    logits_sum: torch.Tensor | None = None
+    combination_count = 0
+    flips = (False, True)
+
+    if long_edge <= 0:
+        raise ValueError('`long_edge` must be positive.')
+    long_scale = long_edge / max(orig_h, orig_w)
+    long_h = max(int(round(orig_h * long_scale)), 1)
+    long_w = max(int(round(orig_w * long_scale)), 1)
+    tensor, meta = _preprocess_image(
+        image=base_image,
+        target_size=(long_h, long_w),
+        orig_size=orig_size,
+        pad_to_divisor=True,
         size_divisor=size_divisor,
+        flip=False,
     )
-    orig_h, orig_w = meta['orig_size']
-    resized_h, resized_w = meta['resized_size']
-    pad_h, pad_w = meta['pad']
-    tensor = tensor.to(device)
+    logits = _forward_variant(model, tensor, meta, device)
+    logits_sum = logits if logits_sum is None else logits_sum + logits
+    combination_count += 1
 
-    # TorchScript module returns raw logits; gradients are not required here.
-    with torch.no_grad():
-        logits = model(tensor)
+    for scale in tta_scales:
+        if scale <= 0:
+            raise ValueError('All TTA scales must be positive.')
+        target_h = max(int(round(orig_h * scale)), 1)
+        target_w = max(int(round(orig_w * scale)), 1)
 
-    if pad_h or pad_w:
-        valid_h = logits.shape[2] - pad_h
-        valid_w = logits.shape[3] - pad_w
-        logits = logits[..., :valid_h, :valid_w]
+        for flip in flips:
+            tensor, meta = _preprocess_image(
+                image=base_image,
+                target_size=(target_h, target_w),
+                orig_size=orig_size,
+                pad_to_divisor=True,
+                size_divisor=size_divisor,
+                flip=flip,
+            )
+            logits = _forward_variant(model, tensor, meta, device)
+            logits_sum = logits if logits_sum is None else logits_sum + logits
+            combination_count += 1
 
-    # If the image was resized for inference, bring logits back to the original size.
-    if (resized_h, resized_w) != (orig_h, orig_w):
-        logits = F.interpolate(logits, size=(orig_h, orig_w), mode='bilinear', align_corners=False)
+    if logits_sum is None or combination_count == 0:
+        raise RuntimeError('TTA inference failed to produce any logits.')
 
+    logits = logits_sum / combination_count
     num_classes_hint = logits.shape[1]
     mask = logits_to_mask(logits, num_classes_hint, threshold)
 
     if output_path is None:
-        # Default to <image>_mask.png beside the source input.
         output_path = image_path.with_name(f'{image_path.stem}_mask.png')
 
-    save_mask(mask, output_path, binary_colormap=binary_colormap, original_size=(orig_h, orig_w))
-
+    save_mask(mask, output_path, binary_colormap=binary_colormap, original_size=orig_size)
     return output_path
+
+
+def run_inference(model_path: Path,
+                  image_path: Path,
+                  output_path: Path | None,
+                  device: str,
+                  threshold: float,
+                  binary_colormap: bool) -> Path:
+    """Load TorchScript model and run fixed multi-scale TTA inference."""
+    model = torch.jit.load(str(model_path), map_location=device)
+    model.eval()
+
+    return _run_tta_inference(
+        model=model,
+        image_path=image_path,
+        output_path=output_path,
+        device=device,
+        threshold=threshold,
+        binary_colormap=binary_colormap,
+        size_divisor=SIZE_DIVISOR,
+        tta_scales=DEFAULT_TTA_SCALES,
+        long_edge=LONG_EDGE,
+    )
 
 
 def main() -> None:
@@ -186,17 +227,6 @@ def main() -> None:
     parser.add_argument('--model', required=True, help='Path to TorchScript (.pt) file.')
     parser.add_argument('--image', required=True, help='Input image file (.png/.jpg/.jpeg).')
     parser.add_argument('--output', help='Output mask image path (default: <image>_mask.png).')
-    parser.add_argument('--shape', nargs=2, type=int, default=(1024, 1024),
-                        metavar=('HEIGHT', 'WIDTH'),
-                        help='Resize input to HEIGHT WIDTH before inference (default: 1024 1024).')
-    parser.add_argument('--no-resize', action='store_true',
-                        help='Skip resizing; use raw image size (requires model traced with dynamic shapes).')
-    parser.add_argument('--match-test-pipeline', action='store_true',
-                        help='Approximate mmseg test_pipeline: keep ratio to long edge, then pad to size divisor.')
-    parser.add_argument('--long-edge', type=int, default=1536,
-                        help='Target long edge when --match-test-pipeline is set (default: 1536).')
-    parser.add_argument('--size-divisor', type=int, default=32,
-                        help='Padding multiple when --match-test-pipeline is set (default: 32).')
     parser.add_argument('--device', default='cpu', help='Inference device, e.g., cpu or cuda:0.')
     parser.add_argument('--threshold', type=float, default=0.5,
                         help='Threshold for binary segmentation when model outputs a single channel.')
@@ -205,28 +235,15 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.match_test_pipeline and args.no_resize:
-        parser.error('--match-test-pipeline cannot be used together with --no-resize.')
-
-    # Determine whether to align inputs with the traced shape or trust native resolution.
-    resize_shape = None if args.no_resize else parse_shape(args.shape)
-    if args.match_test_pipeline:
-        resize_shape = None  # when matching pipeline we derive shape from long edge
-
     output_path = run_inference(
         model_path=Path(args.model),
         image_path=Path(args.image),
         output_path=Path(args.output) if args.output else None,
-        resize_shape=resize_shape,
-        match_test_pipeline=args.match_test_pipeline,
-        long_edge=args.long_edge,
-        size_divisor=args.size_divisor,
         device=args.device,
         threshold=args.threshold,
         binary_colormap=args.binary_colormap,
     )
 
-    # CLI feedback with the destination path.
     print(f'Mask saved to: {output_path}')
 
 
